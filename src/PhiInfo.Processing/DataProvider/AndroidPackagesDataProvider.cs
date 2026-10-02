@@ -2,6 +2,8 @@
 using System.Collections.Generic;
 using System.Diagnostics.CodeAnalysis;
 using System.IO;
+using AssetsTools.NET;
+using AssetsTools.NET.Extra;
 using PhiInfo.Core.Type;
 using Shua.Zip;
 
@@ -11,7 +13,10 @@ public class AndroidPackagesDataProvider(IEnumerable<ShuaZip> zips, Stream cldbS
 {
     private const string DataPrefix = "assets/bin/Data/";
     private const string RuntimePathPlaceholder = "{UnityEngine.AddressableAssets.Addressables.RuntimePath}";
+    private const string PlayerDataName = "data.unity3d";
     private bool _disposed;
+    private bool _playerDataLoaded;
+    private AssetBundleFile? _playerData;
 
     public Stream GetCldb()
     {
@@ -23,8 +28,7 @@ public class AndroidPackagesDataProvider(IEnumerable<ShuaZip> zips, Stream cldbS
 
     public Stream GetGlobalGameManagers()
     {
-        var (zip, entry) = FindEntryInAllZips("assets/bin/Data/globalgamemanagers.assets");
-        return EnsureSeekable(zip.OpenFileStream(entry));
+        return GetDataFile("globalgamemanagers.assets");
     }
 
     public byte[] GetIl2CppBinary()
@@ -51,6 +55,19 @@ public class AndroidPackagesDataProvider(IEnumerable<ShuaZip> zips, Stream cldbS
             return EnsureSeekable(zip.OpenFileStream(entry));
 
         // 旧版本会把 level 等文件切成 <name>.splitN 分片
+        var parts = FindSplitParts(name);
+        if (parts.Count != 0)
+            return ConcatParts(parts);
+
+        // 4.0.1 起序列化文件(level、sharedassets 等)被打包进 data.unity3d
+        if (TryOpenPlayerDataFile(name, out var playerDataStream))
+            return playerDataStream;
+
+        throw new FileNotFoundException($"Required Unity asset '{DataPrefix}{name}' missing from provided packages.");
+    }
+
+    private List<(int index, string name, ShuaZip zip)> FindSplitParts(string name)
+    {
         var partPrefix = DataPrefix + name + ".split";
         var parts = new List<(int index, string name, ShuaZip zip)>();
 
@@ -67,11 +84,12 @@ public class AndroidPackagesDataProvider(IEnumerable<ShuaZip> zips, Stream cldbS
             }
         }
 
-        if (parts.Count == 0)
-            throw new FileNotFoundException($"Required Unity asset '{DataPrefix}{name}' missing from provided packages.");
-
         parts.Sort((a, b) => a.index.CompareTo(b.index));
+        return parts;
+    }
 
+    private static MemoryStream ConcatParts(IReadOnlyList<(int index, string name, ShuaZip zip)> parts)
+    {
         MemoryStream data = new();
 
         foreach (var (_, partName, partZip) in parts)
@@ -111,7 +129,63 @@ public class AndroidPackagesDataProvider(IEnumerable<ShuaZip> zips, Stream cldbS
             }
         }
 
+        // 4.0.1 起序列化文件被打包进 data.unity3d
+        if (PlayerData is { } playerData)
+        {
+            foreach (var name in playerData.GetAllFileNames())
+            {
+                if (seen.Add(name))
+                    names.Add(name);
+            }
+        }
+
         return names;
+    }
+
+    /// <summary>
+    ///     assets/bin/Data/data.unity3d,内部为 LZ4HC 分块压缩的 UnityFS。
+    /// </summary>
+    private AssetBundleFile? PlayerData
+    {
+        get
+        {
+            if (_playerDataLoaded) return _playerData;
+            _playerDataLoaded = true;
+
+            if (!TryFindEntryInAllZips(DataPrefix + PlayerDataName, out var zip, out var entry))
+                return _playerData = null;
+
+            var stream = EnsureSeekable(zip.OpenFileStream(entry));
+
+            var bundle = new AssetBundleFile();
+            bundle.Read(new AssetsFileReader(stream));
+
+            if (!bundle.DataIsCompressed)
+                return _playerData = bundle;
+
+            var unpacked = BundleHelper.UnpackBundle(bundle);
+            bundle.Close();
+            stream.Dispose();
+
+            return _playerData = unpacked;
+        }
+    }
+
+    private bool TryOpenPlayerDataFile(string name, [NotNullWhen(true)] out Stream? stream)
+    {
+        stream = null;
+
+        if (PlayerData is not { } playerData)
+            return false;
+
+        var index = playerData.GetFileIndex(name);
+        if (index < 0)
+            return false;
+
+        playerData.GetFileRange(index, out var offset, out var size);
+
+        stream = new SegmentStream(playerData.DataReader.BaseStream, offset, size);
+        return true;
     }
 
     public Stream GetCatalog()
@@ -197,6 +271,7 @@ public class AndroidPackagesDataProvider(IEnumerable<ShuaZip> zips, Stream cldbS
 
         if (disposing)
         {
+            _playerData?.Close();
             cldbStream.Dispose();
             foreach (var item in zips) item.Dispose();
         }

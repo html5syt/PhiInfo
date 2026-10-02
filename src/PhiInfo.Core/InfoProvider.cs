@@ -10,31 +10,38 @@ namespace PhiInfo.Core;
 
 public class InfoProvider : IDisposable
 {
-    // 4.0.0 (code 155) 起收藏品数据被拆成两份:文件夹仍在 SaturnOS 场景里,
-    // 条目则迁移到 sharedassets22.assets,且以 getSong 的绝对值作为索引。
     private const uint SharedAssetsCollectionVersion = 155;
+
+    private const string GameInformationScript = "GameInformation";
     private const string CollectionSceneScript = "SaturnOSControl";
-    private const string CollectionSceneFileName = "level22";
     private const string CollectionDatabaseScript = "CollectionDatabase";
-    private const string SharedAssetsFileName = "sharedassets22.assets";
+    private const string GetCollectionControlScript = "GetCollectionControl";
+    private const string TipsProviderScript = "TipsProvider";
+
+    private static readonly string[] RequiredScripts =
+    {
+        GameInformationScript,
+        CollectionSceneScript,
+        GetCollectionControlScript,
+        TipsProviderScript
+    };
 
     private readonly IInfoDataProvider _dataProvider;
     private readonly FieldProvider _fieldProvider;
-    private readonly Lazy<AssetsFile> _level0;
-    private readonly Lazy<AssetsFile> _collectionScene;
-    private readonly Lazy<AssetsFile> _collectionDatabase;
+    private readonly Lazy<Dictionary<string, ScriptEntry>> _scripts;
     private readonly Lazy<PhiVersion> _version;
     private bool _disposed;
 
-    public InfoProvider(IInfoDataProvider dataProvider, FieldProvider fieldProvider)
+    public InfoProvider(
+        IInfoDataProvider dataProvider,
+        FieldProvider fieldProvider)
     {
         _dataProvider = dataProvider;
         _fieldProvider = fieldProvider;
-        _level0 = new Lazy<AssetsFile>(() => ReadAssetsFile(dataProvider.GetDataFile("level0")));
-        _collectionScene = new Lazy<AssetsFile>(() =>
-            FindMonoBehaviourFile(CollectionSceneScript, CollectionSceneFileName));
-        _collectionDatabase = new Lazy<AssetsFile>(() =>
-            FindMonoBehaviourFile(CollectionDatabaseScript, SharedAssetsFileName));
+
+        _scripts = new Lazy<Dictionary<string, ScriptEntry>>(
+            FindScripts);
+
         _version = new Lazy<PhiVersion>(GetPhiVersion);
     }
 
@@ -45,37 +52,93 @@ public class InfoProvider : IDisposable
         return file;
     }
 
-    /// <summary>
-    ///     找出包含指定 MonoBehaviour 的资源文件。优先尝试已知文件名,版本变动导致位置变化时按文件名扫描。
-    /// </summary>
-    private AssetsFile FindMonoBehaviourFile(string scriptName, string preferredFileName)
+    private Dictionary<string, ScriptEntry> FindScripts()
     {
-        var names = new List<string> { preferredFileName };
+        var result = new Dictionary<string, ScriptEntry>(
+            StringComparer.Ordinal);
+
+        var required = new HashSet<string>(
+            RequiredScripts,
+            StringComparer.Ordinal);
+
+        // CollectionDatabase 是 4.0 (code 155) 起才有的收藏品数据库
+        if (_version.Value.code >= SharedAssetsCollectionVersion)
+            required.Add(CollectionDatabaseScript);
 
         foreach (var name in _dataProvider.GetDataFileNames())
         {
-            if (name != preferredFileName)
-                names.Add(name);
-        }
+            AssetsFile file;
 
-        foreach (var name in names)
-        {
             try
             {
-                var file = ReadAssetsFile(_dataProvider.GetDataFile(name));
-
-                if (_fieldProvider.TryFindMonoBehaviour(file, scriptName) is not null)
-                    return file;
-
-                file.Close();
+                file = ReadAssetsFile(_dataProvider.GetDataFile(name));
             }
             catch (Exception)
             {
-                // 不是资源文件或读取失败时继续尝试下一个
+                continue;
             }
+
+            var found = false;
+
+            foreach (var scriptName in required)
+            {
+                if (result.ContainsKey(scriptName))
+                    continue;
+
+                try
+                {
+                    var behaviour = _fieldProvider.TryFindMonoBehaviour(
+                        file,
+                        scriptName);
+
+                    if (behaviour is null)
+                        continue;
+
+                    result.Add(
+                        scriptName,
+                        new ScriptEntry(file, behaviour));
+
+                    found = true;
+                }
+                catch (Exception)
+                {
+                    // 当前文件无法解析该脚本时继续寻找。
+                }
+            }
+
+            if (result.Count == required.Count)
+                break;
+
+            if (!found)
+                file.Close();
         }
 
-        throw new InvalidOperationException($"Cannot find {scriptName} in the provided packages.");
+        var missing = required
+            .Where(script => !result.ContainsKey(script))
+            .ToList();
+
+        if (missing.Count != 0)
+        {
+            foreach (var file in result.Values
+                         .Select(x => x.File)
+                         .Distinct())
+            {
+                file.Close();
+            }
+
+            throw new InvalidOperationException(
+                $"Cannot find MonoBehaviours: {string.Join(", ", missing)}");
+        }
+
+        return result;
+    }
+
+    private AssetTypeValueField GetScript(string scriptName)
+    {
+        if (_disposed)
+            throw new ObjectDisposedException(nameof(InfoProvider));
+
+        return _scripts.Value[scriptName].Behaviour;
     }
 
     public void Dispose()
@@ -86,18 +149,25 @@ public class InfoProvider : IDisposable
 
     protected virtual void Dispose(bool disposing)
     {
-        if (_disposed) return;
+        if (_disposed)
+            return;
+
         _disposed = true;
 
-        if (disposing)
+        if (disposing && _scripts.IsValueCreated)
         {
-            foreach (var file in new[] { _level0, _collectionScene, _collectionDatabase })
-                if (file.IsValueCreated)
-                    file.Value.Close();
+            foreach (var file in _scripts.Value
+                         .Values
+                         .Select(x => x.File)
+                         .Distinct())
+            {
+                file.Close();
+            }
         }
     }
 
-    private static Dictionary<Language, string> ExtractMultiLang(AssetTypeValueField field,
+    private static Dictionary<Language, string> ExtractMultiLang(
+        AssetTypeValueField field,
         Func<string, string>? hook = null)
     {
         var result = new Dictionary<Language, string>();
@@ -107,13 +177,13 @@ public class InfoProvider : IDisposable
             if (child.FieldName == "code")
                 continue;
 
-            var lang = Extensions.FromString(child.FieldName);
+            var language = Extensions.FromString(child.FieldName);
             var value = child.AsString;
 
             if (hook != null)
                 value = hook(value);
 
-            result[lang] = value;
+            result[language] = value;
         }
 
         return result;
@@ -121,8 +191,7 @@ public class InfoProvider : IDisposable
 
     public List<SongInfo> ExtractSongs()
     {
-        var gameInfo = _fieldProvider.FindMonoBehaviour(_level0.Value, "GameInformation")
-                       ?? throw new InvalidOperationException("GameInformation MonoBehaviour not found");
+        var gameInfo = GetScript(GameInformationScript);
 
         var songs = gameInfo["song"]
             .Children
@@ -143,8 +212,9 @@ public class InfoProvider : IDisposable
                     .Where(x => x.Diff != 0)
                     .ToDictionary(
                         x => x.Level,
-                        x => new SongLevel(x.Charter, Math.Round(x.Diff, 1))
-                    );
+                        x => new SongLevel(
+                            x.Charter,
+                            Math.Round(x.Diff, 1)));
 
                 return levelDict.Count == 0
                     ? null
@@ -156,8 +226,7 @@ public class InfoProvider : IDisposable
                         song["illustrator"].AsString,
                         Math.Round(song["previewTime"].AsDouble, 2),
                         Math.Round(song["previewEndTime"].AsDouble, 2),
-                        levelDict
-                    );
+                        levelDict);
             })
             .Where(song => song != null)
             .ToList();
@@ -170,8 +239,7 @@ public class InfoProvider : IDisposable
         if (_version.Value.code >= SharedAssetsCollectionVersion)
             return ExtractCollectionFromSharedAssets();
 
-        var control = _fieldProvider.FindMonoBehaviour(_collectionScene.Value, CollectionSceneScript)
-                      ?? throw new InvalidOperationException("SaturnOSControl MonoBehaviour not found");
+        var control = GetScript(CollectionSceneScript);
 
         return control["folders"]["Array"].Children
             .Select(folder =>
@@ -184,56 +252,63 @@ public class InfoProvider : IDisposable
                     ExtractMultiLang(folder["title"]),
                     ExtractMultiLang(folder["subTitle"]),
                     folder["cover"].AsString,
-                    files
-                );
+                    files);
             })
             .ToList();
     }
 
     private List<Folder> ExtractCollectionFromSharedAssets()
     {
-        var database = _fieldProvider.FindMonoBehaviour(_collectionDatabase.Value, CollectionDatabaseScript)
-                       ?? throw new InvalidOperationException("CollectionDatabase MonoBehaviour not found");
+        var database = GetScript(CollectionDatabaseScript);
 
         var items = database["items"]["Array"].Children
-            .Select(item => new CollectionEntry(ExtractFileItem(item), Math.Abs(item["getSong"].AsInt)))
+            .Select(item => new CollectionEntry(
+                ExtractFileItem(item),
+                Math.Abs(item["getSong"].AsInt)))
             .ToList();
 
-        var control = _fieldProvider.FindMonoBehaviour(_collectionScene.Value, CollectionSceneScript)
-                      ?? throw new InvalidOperationException("SaturnOSControl MonoBehaviour not found");
+        var control = GetScript(CollectionSceneScript);
 
         return control["folders"]["Array"].Children
             .Select(folder => new Folder(
                 ExtractMultiLang(folder["title"]),
                 ExtractMultiLang(folder["subTitle"]),
                 folder["cover"].AsString,
-                ExtractFolderFiles(folder, items)
-            ))
+                ExtractFolderFiles(folder, items)))
             .ToList();
     }
 
-    private static List<FileItem> ExtractFolderFiles(AssetTypeValueField folder, List<CollectionEntry> items)
+    private static List<FileItem> ExtractFolderFiles(
+        AssetTypeValueField folder,
+        List<CollectionEntry> items)
     {
         var start = folder["startIndex"].AsInt;
         var end = folder["endIndex"].AsInt;
 
         var excluded = folder["excludedFiles"]["Array"].Children
-            .Select(range => (Start: range["start"].AsInt, End: range["end"].AsInt))
+            .Select(range => (
+                Start: range["start"].AsInt,
+                End: range["end"].AsInt))
             .ToList();
 
         var files = items
-            .Where(item => item.Index >= start && item.Index <= end &&
-                           !excluded.Any(range => item.Index >= range.Start && item.Index <= range.End))
+            .Where(item =>
+                item.Index >= start &&
+                item.Index <= end &&
+                !excluded.Any(range =>
+                    item.Index >= range.Start &&
+                    item.Index <= range.End))
             .Select(item => item.File)
             .ToList();
 
-        // 索引区间之外的条目由 includedIsolatedFiles 单独指定
         foreach (var reference in folder["includedIsolatedFiles"]["Array"].Children)
         {
             var key = reference["key"].AsString;
             var subIndex = reference["subIndex"].AsInt;
 
-            var item = items.FirstOrDefault(entry => entry.File.key == key && entry.File.sub_index == subIndex);
+            var item = items.FirstOrDefault(entry =>
+                entry.File.key == key &&
+                entry.File.sub_index == subIndex);
 
             if (item != null && !files.Contains(item.File))
                 files.Add(item.File);
@@ -251,39 +326,41 @@ public class InfoProvider : IDisposable
             file["date"].AsString,
             ExtractMultiLang(file["supervisor"]),
             file["category"].AsString,
-            ExtractMultiLang(file["content"], v => v.Replace("\\n", "\n")),
-            ExtractMultiLang(file["properties"])
-        );
+            ExtractMultiLang(
+                file["content"],
+                value => value.Replace("\\n", "\n")),
+            ExtractMultiLang(file["properties"]));
     }
 
-    private sealed record CollectionEntry(FileItem File, int Index);
+    private sealed record CollectionEntry(
+        FileItem File,
+        int Index);
+
+    private sealed record ScriptEntry(
+        AssetsFile File,
+        AssetTypeValueField Behaviour);
 
     public List<Avatar> ExtractAvatars()
     {
-        var control = _fieldProvider.FindMonoBehaviour(_level0.Value, "GetCollectionControl")
-                      ?? throw new InvalidOperationException("GetCollectionControl MonoBehaviour not found");
+        var control = GetScript(GetCollectionControlScript);
 
         return control["avatars"]["Array"].Children
             .Select(a => new Avatar(
                 a["name"].AsString,
-                a["addressableKey"].AsString
-            ))
+                a["addressableKey"].AsString))
             .ToList();
     }
 
     public Dictionary<Language, List<string>> ExtractTips()
     {
-        var provider = _fieldProvider.FindMonoBehaviour(_level0.Value, "TipsProvider")
-                       ?? throw new InvalidOperationException("TipsProvider MonoBehaviour not found");
+        var provider = GetScript(TipsProviderScript);
 
         var result = new Dictionary<Language, List<string>>();
 
-        var array = provider["tips"]["Array"].Children;
-
-        foreach (var entry in array)
+        foreach (var entry in provider["tips"]["Array"].Children)
         {
-            var langValue = entry["language"].AsInt;
-            var language = Extensions.FromInt(langValue);
+            var language = Extensions.FromInt(
+                entry["language"].AsInt);
 
             var tips = entry["tips"]["Array"].Children
                 .Select(t => t.AsString)
@@ -297,8 +374,7 @@ public class InfoProvider : IDisposable
 
     public List<ChapterInfo> ExtractChapters()
     {
-        var gameInfo = _fieldProvider.FindMonoBehaviour(_level0.Value, "GameInformation")
-                       ?? throw new InvalidOperationException("GameInformation MonoBehaviour not found");
+        var gameInfo = GetScript(GameInformationScript);
 
         return gameInfo["chapters"]["Array"].Children
             .Select(chapter =>
@@ -312,8 +388,7 @@ public class InfoProvider : IDisposable
                 return new ChapterInfo(
                     chapter["chapterCode"].AsString,
                     songInfo["banner"].AsString,
-                    songs
-                );
+                    songs);
             })
             .ToList();
     }
@@ -323,37 +398,58 @@ public class InfoProvider : IDisposable
         var meta = _fieldProvider.GetMetadata();
 
         var assembly = meta.AssemblyDefinitions
-                           .FirstOrDefault(a => a.AssemblyName.Name == "Assembly-CSharp")
-                       ?? throw new InvalidDataException("Cannot find Assembly-CSharp.");
+                           .FirstOrDefault(a =>
+                               a.AssemblyName.Name == "Assembly-CSharp")
+                       ?? throw new InvalidDataException(
+                           "Cannot find Assembly-CSharp.");
 
         var type = assembly.Image.Types?
                        .FirstOrDefault(t => t.FullName == "Constants")
-                   ?? throw new InvalidDataException("Cannot find Constants class.");
+                   ?? throw new InvalidDataException(
+                       "Cannot find Constants class.");
 
         var codeField = type.Fields?
                             .FirstOrDefault(f => f.Name == "IntVersion")
-                        ?? throw new InvalidDataException("Cannot find IntVersion field.");
+                        ?? throw new InvalidDataException(
+                            "Cannot find IntVersion field.");
 
-        var codeDefaultValue = meta.GetFieldDefaultValue(codeField)?.Value
-                               ?? throw new InvalidDataException("There is no default value for the IntVersion field.");
+        var codeDefaultValue =
+            meta.GetFieldDefaultValue(codeField)?.Value
+            ?? throw new InvalidDataException(
+                "There is no default value for the IntVersion field.");
 
         var nameField = type.Fields?
                             .FirstOrDefault(f => f.Name == "Version")
-                        ?? throw new InvalidDataException("Cannot find Version field.");
+                        ?? throw new InvalidDataException(
+                            "Cannot find Version field.");
 
-        var nameDefaultValue = meta.GetFieldDefaultValue(nameField)?.Value
-                               ?? throw new InvalidDataException("There is no default value for the Version field.");
+        var nameDefaultValue =
+            meta.GetFieldDefaultValue(nameField)?.Value
+            ?? throw new InvalidDataException(
+                "There is no default value for the Version field.");
 
-        if (codeDefaultValue is int intValue && nameDefaultValue is string stringValue)
-            return new PhiVersion((uint)intValue, stringValue);
+        if (codeDefaultValue is int intValue &&
+            nameDefaultValue is string stringValue)
+        {
+            return new PhiVersion(
+                (uint)intValue,
+                stringValue);
+        }
 
         throw new InvalidDataException(
-            $"Invalid version type: {nameDefaultValue.GetType()} and {codeDefaultValue.GetType()}");
+            $"Invalid version type: " +
+            $"{nameDefaultValue.GetType()} and " +
+            $"{codeDefaultValue.GetType()}");
     }
 
     public AllInfo ExtractAllInfo()
     {
-        return new AllInfo(GetPhiVersion(), ExtractSongs(), ExtractCollection(), ExtractAvatars(), ExtractTips(),
+        return new AllInfo(
+            GetPhiVersion(),
+            ExtractSongs(),
+            ExtractCollection(),
+            ExtractAvatars(),
+            ExtractTips(),
             ExtractChapters());
     }
 }
