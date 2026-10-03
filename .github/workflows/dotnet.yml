@@ -1,5 +1,4 @@
 name: dotnet-ci
-
 on:
   push:
     branches: [ "main" ]
