@@ -33,7 +33,24 @@ jobs:
 
     - name: Setup Tpk
       run: |
-        curl -L -o tpk.zip https://nightly.link/AssetRipper/Tpk/workflows/type_tree_tpk/master/uncompressed_file.zip
+        set -euo pipefail
+
+        for i in 1 2 3 4 5; do
+          curl -L --retry 3 --retry-delay 5 \
+            -o tpk.zip \
+            "https://nightly.link/AssetRipper/Tpk/workflows/type_tree_tpk/master/uncompressed_file.zip"
+
+          if unzip -tq tpk.zip >/dev/null 2>&1; then
+            echo "tpk.zip 下载有效"
+            break
+          fi
+
+          echo "第 $i 次下载无效，10 秒后重试..."
+          rm -f tpk.zip
+          sleep 10
+        done
+
+        unzip -tq tpk.zip
         unzip tpk.zip uncompressed.tpk
 
     - name: Restore PhiInfo
